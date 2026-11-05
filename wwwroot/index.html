@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ollama Production Chat</title>
+<style>
+  :root { color-scheme: dark; --bg: #15171a; --panel: #1f2226; --text: #e6e6e6; --muted: #8a8f98; --accent: #4f9cf9; --ok: #3fb950; --warn: #d29922; --err: #f85149; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; justify-content: center; }
+  main { width: min(760px, 100%); height: 100vh; display: flex; flex-direction: column; padding: 16px; gap: 12px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0; flex: 1; }
+  .pill { padding: 2px 10px; border-radius: 999px; font-size: 13px; border: 1px solid currentColor; }
+  .pill.ready { color: var(--ok); } .pill.warming { color: var(--warn); } .pill.cold, .pill.error { color: var(--err); }
+  #log { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .msg { padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; max-width: 85%; }
+  .user { background: var(--accent); color: #fff; align-self: flex-end; }
+  .assistant { background: var(--panel); align-self: flex-start; }
+  .thinking { color: var(--muted); font-style: italic; font-size: 13px; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .badge { color: var(--warn); font-size: 12px; margin-left: 6px; }
+  .typing::after { content: "..."; animation: blink 1s infinite; } @keyframes blink { 50% { opacity: .2; } }
+  form { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #333; background: var(--panel); color: var(--text); }
+  button { padding: 8px 14px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: #30343a; } button:disabled { opacity: .5; cursor: default; }
+  @media (prefers-reduced-motion: reduce) { .typing::after { animation: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Ollama Production Chat</h1>
+    <span id="status" class="pill cold">Checking model…</span>
+    <label><input type="checkbox" id="useAgent"> Agent Framework</label>
+    <button class="secondary" id="newChat" type="button">New chat</button>
+  </header>
+  <div id="log" aria-live="polite"></div>
+  <form id="form">
+    <input type="text" id="input" placeholder="Ask something…" autocomplete="off" required>
+    <button id="send">Send</button>
+    <button id="stop" class="secondary" type="button" disabled>Stop</button>
+  </form>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let conversationId = localStorage.getItem("conversationId") ?? newId();
+let controller = null;
+let lastMessage = null;
+
+function newId() {
+  const id = crypto.randomUUID();
+  localStorage.setItem("conversationId", id);
+  return id;
+}
+
+// Preload on intent: start loading the model while the user is still reading or typing.
+async function warm() {
+  await fetch("/api/ai/warm", { method: "POST" }).catch(() => {});
+  pollStatus();
+}
+
+async function pollStatus() {
+  try {
+    const s = await (await fetch("/api/ai/status")).json();
+    const pill = $("status");
+    if (s.loaded) {
+      pill.className = "pill ready";
+      pill.textContent = `Ready · ${s.processor}`;
+      return;
+    }
+    pill.className = s.warming ? "pill warming" : "pill cold";
+    pill.textContent = s.warming ? "Warming up model…" : (s.lastWarmupError ? "Model unavailable" : "Model not loaded");
+    if (s.warming) setTimeout(pollStatus, 1500);
+  } catch {
+    $("status").className = "pill error";
+    $("status").textContent = "Server unreachable";
+  }
+}
+
+function bubble(role, text = "") {
+  const el = document.createElement("div");
+  el.className = `msg ${role}`;
+  el.textContent = text;
+  $("log").append(el);
+  $("log").scrollTop = $("log").scrollHeight;
+  return el;
+}
+
+async function loadHistory() {
+  const history = await (await fetch(`/api/chat/${conversationId}`)).json();
+  $("log").replaceChildren();
+  for (const m of history) {
+    const el = bubble(m.role, m.text);
+    if (m.status === "Interrupted") el.insertAdjacentHTML("beforeend", '<span class="badge">interrupted</span>');
+  }
+}
+
+async function send(message) {
+  lastMessage = message;
+  bubble("user", message);
+  const answer = bubble("assistant");
+  answer.classList.add("typing");
+  const thinking = document.createElement("div");
+  thinking.className = "thinking";
+  answer.before(thinking);
+
+  controller = new AbortController();
+  setBusy(true);
+  const endpoint = $("useAgent").checked ? "agent-chat" : "chat";
+  let finished = false;
+
+  try {
+    // EventSource can't POST a body, so read the SSE stream from fetch ourselves.
+    const response = await fetch(`/api/${endpoint}/${conversationId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+      signal: controller.signal,
+    });
+
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value;
+      let split;
+      while ((split = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        const event = /^event: (.*)$/m.exec(frame)?.[1] ?? "message";
+        const data = JSON.parse(frame.split("\n").filter(l => l.startsWith("data: ")).map(l => l.slice(6)).join("\n"));
+        finished ||= handle(event, data, answer, thinking);
+      }
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") showError(answer, err.message);
+  } finally {
+    answer.classList.remove("typing");
+    if (!finished && controller.signal.aborted) answer.insertAdjacentHTML("beforeend", '<span class="badge">interrupted</span>');
+    if (!thinking.textContent) thinking.remove();
+    setBusy(false);
+    controller = null;
+  }
+}
+
+function handle(event, data, answer, thinking) {
+  switch (event) {
+    case "token":
+      answer.classList.remove("typing");
+      answer.append(data.text);
+      $("log").scrollTop = $("log").scrollHeight;
+      return false;
+    case "thinking":
+      thinking.append(data.text);
+      return false;
+    case "done":
+      answer.insertAdjacentHTML("beforeend",
+        `<div class="meta">first token ${Math.round(data.timeToFirstTokenMs)} ms · total ${(data.totalMs / 1000).toFixed(1)} s · ${data.outputTokens ?? data.chunks} tokens</div>`);
+      return true;
+    case "error":
+      showError(answer, data.message, data.retryable);
+      return true;
+  }
+  return false;
+}
+
+function showError(answer, message, retryable = true) {
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = `⚠ ${message} `;
+  if (retryable && lastMessage) {
+    const retry = document.createElement("button");
+    retry.className = "secondary";
+    retry.textContent = "Retry";
+    retry.onclick = () => send(lastMessage);
+    meta.append(retry);
+  }
+  answer.append(meta);
+}
+
+function setBusy(busy) {
+  $("send").disabled = busy;
+  $("stop").disabled = !busy;
+}
+
+$("form").onsubmit = e => {
+  e.preventDefault();
+  const message = $("input").value.trim();
+  if (!message || controller) return;
+  $("input").value = "";
+  send(message);
+};
+$("stop").onclick = () => controller?.abort();
+$("input").addEventListener("focus", warm, { once: true });
+$("newChat").onclick = async () => {
+  await fetch(`/api/chat/${conversationId}`, { method: "DELETE" });
+  conversationId = newId();
+  $("log").replaceChildren();
+};
+
+warm();
+loadHistory();
+</script>
+</body>
+</html>
